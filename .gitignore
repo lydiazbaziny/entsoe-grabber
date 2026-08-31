@@ -1,0 +1,36 @@
+*.code-workspace
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Build artifacts
+build/
+
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+crash.log
+*.tfvars
+!*.tfvars.example
+override.tf
+override.tf.json
+.terraformrc
+terraform.rc
+# NOTE: .terraform.lock.hcl is deliberately NOT ignored - it pins provider
+# versions and belongs in version control.
+
+# Local secrets / credentials
+.env
+.env.local
+
+notes.txt
+
+CLAUDE.md
