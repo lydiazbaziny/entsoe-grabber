@@ -1,6 +1,6 @@
 [build-system]
 build-backend = "hatchling.build"
-requires = [ "hatchling" ]
+requires = [ "hatchling==1.32" ]
 
 [project]
 name = "entsoe-grabber"
@@ -65,5 +65,3 @@ run.source = [ "entsoe_grabber" ]
 python_version = "3.14"
 files = [ "src", "tests" ]
 strict = true
-ignore_missing_imports = true
-overrides = [ { module = "entsoe.*", implicit_reexport = true } ]
