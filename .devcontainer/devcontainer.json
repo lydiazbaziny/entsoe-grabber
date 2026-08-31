@@ -35,13 +35,24 @@
     "AWS_SECRET_ACCESS_KEY": "${localEnv:AWS_SECRET_ACCESS_KEY}",
     "AWS_SESSION_TOKEN": "${localEnv:AWS_SESSION_TOKEN}",
     "UV_LINK_MODE": "copy",
-    "TF_PLUGIN_CACHE_DIR": "/home/vscode/.terraform.d/plugin-cache"
+    "TF_PLUGIN_CACHE_DIR": "/home/vscode/.terraform.d/plugin-cache",
+    // The workspace bind mount answers access(2) with "executable" for every
+    // file, whatever mode it actually has. pre-commit's `executable` file type
+    // then matches everything, and check-executables-have-shebangs -- which
+    // falls back to the real mode unless core.fileMode is false -- fails every
+    // file without a shebang. Git applies GIT_CONFIG_* as if passed with `-c`,
+    // so this outranks the repo's own `filemode = true` without editing
+    // .git/config, which lives on the mount and is shared with the host.
+    "GIT_CONFIG_COUNT": "1",
+    "GIT_CONFIG_KEY_0": "core.fileMode",
+    "GIT_CONFIG_VALUE_0": "false"
   },
   "remoteEnv": {
     "PATH": "${containerWorkspaceFolder}/.venv/bin:${containerEnv:PATH}"
   },
   "mounts": [
     "source=entsoe-grabber-uv-cache,target=/home/vscode/.cache/uv,type=volume",
+    "source=entsoe-grabber-pre-commit-cache,target=/home/vscode/.cache/pre-commit,type=volume",
     "source=entsoe-grabber-tf-cache,target=/home/vscode/.terraform.d/plugin-cache,type=volume",
     "source=entsoe-grabber-claude,target=/home/vscode/.claude,type=volume"
   ],

@@ -7,7 +7,7 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
-.coverage
+.coverage_files/
 htmlcov/
 
 # Build artifacts
@@ -33,4 +33,4 @@ terraform.rc
 
 notes.txt
 
-CLAUDE.md
+CLAUDE.MD
