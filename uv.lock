@@ -349,10 +349,13 @@ wheels = [
 name = "entsoe-grabber"
 version = "0.1.0"
 source = { editable = "." }
+dependencies = [
+    { name = "boto3" },
+    { name = "requests" },
+]
 
 [package.dev-dependencies]
 dev = [
-    { name = "boto3" },
     { name = "boto3-stubs", extra = ["s3", "ssm"] },
     { name = "moto", extra = ["s3", "ssm"] },
     { name = "mypy" },
@@ -365,10 +368,13 @@ dev = [
 ]
 
 [package.metadata]
+requires-dist = [
+    { name = "boto3", specifier = "==1.43.*" },
+    { name = "requests", specifier = "==2.34.*" },
+]
 
 [package.metadata.requires-dev]
 dev = [
-    { name = "boto3", specifier = "==1.43.*" },
     { name = "boto3-stubs", extras = ["s3", "ssm"], specifier = "==1.43.*" },
     { name = "moto", extras = ["s3", "ssm"], specifier = "==5.2.*" },
     { name = "mypy", specifier = "==2.3.*" },

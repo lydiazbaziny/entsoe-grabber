@@ -12,13 +12,13 @@ classifiers = [
   "Programming Language :: Python :: 3 :: Only",
   "Programming Language :: Python :: 3.14",
 ]
-# Runtime dependencies -> these end up in the Lambda layer.
-# boto3/botocore are deliberately NOT here: the Lambda runtime provides them.
-dependencies = []
+# Packaged into the deployment zip rather than taken from the runtime, so the
+# function pins its own versions instead of drifting when AWS updates the
+# runtime's bundled SDK.
+dependencies = [ "boto3==1.43.*", "requests==2.34.*" ]
 
 [dependency-groups]
 dev = [
-  "boto3==1.43.*",               # provided by Lambda at runtime, needed locally
   "boto3-stubs[s3,ssm]==1.43.*",
   "moto[s3,ssm]==5.2.*",
   "mypy==2.3.*",
