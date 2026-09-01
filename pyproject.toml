@@ -14,11 +14,7 @@ classifiers = [
 ]
 # Runtime dependencies -> these end up in the Lambda layer.
 # boto3/botocore are deliberately NOT here: the Lambda runtime provides them.
-dependencies = [
-  "entsoe-py==0.8.*",
-  "pandas==2.3.*",    # entsoe-py declares no upper bound but is unverified on pandas 3.x
-  "requests==2.34.*",
-]
+dependencies = []
 
 [dependency-groups]
 dev = [
@@ -26,7 +22,6 @@ dev = [
   "boto3-stubs[s3,ssm]==1.43.*",
   "moto[s3,ssm]==5.2.*",
   "mypy==2.3.*",
-  "pandas-stubs==2.3.3.*",       # tracks the pinned pandas, not the latest stub release
   "pre-commit==4.6.*",
   "pytest==9.1.*",
   "pytest-cov==7.1.*",

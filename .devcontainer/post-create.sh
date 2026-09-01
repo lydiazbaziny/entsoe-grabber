@@ -18,7 +18,7 @@ sudo chown "$(id -u):$(id -g)" "$HOME/.cache" 2>/dev/null || true
 # uv reads requires-python from pyproject.toml and downloads that exact
 # interpreter if it is not already present. Nothing else pins the version.
 echo "==> Installing the project's Python and dependencies with uv"
-uv sync --all-extras
+uv sync --locked --all-extras
 
 # Hooks live in .git/hooks, which is not part of the image, so this runs per
 # container rather than per build. --install-hooks builds the upstream hook

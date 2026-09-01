@@ -34,6 +34,13 @@
     "AWS_ACCESS_KEY_ID": "${localEnv:AWS_ACCESS_KEY_ID}",
     "AWS_SECRET_ACCESS_KEY": "${localEnv:AWS_SECRET_ACCESS_KEY}",
     "AWS_SESSION_TOKEN": "${localEnv:AWS_SESSION_TOKEN}",
+    // The .claude volume below persists credentials and settings, but Claude
+    // Code keeps its onboarding state -- theme, the logged-in account, the
+    // per-folder trust prompt -- in $HOME/.claude.json, which sits beside
+    // that directory rather than inside it, so the volume alone does not
+    // survive a rebuild. CLAUDE_CONFIG_DIR moves that file onto the volume
+    // too; settings.json and .credentials.json keep the paths they had.
+    "CLAUDE_CONFIG_DIR": "/home/vscode/.claude",
     "UV_LINK_MODE": "copy",
     "TF_PLUGIN_CACHE_DIR": "/home/vscode/.terraform.d/plugin-cache",
     // The workspace bind mount answers access(2) with "executable" for every
