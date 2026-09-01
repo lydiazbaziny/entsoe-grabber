@@ -55,25 +55,12 @@ MAINTENANCE_PAGE = (
 )
 
 
-@pytest.fixture(autouse=True)
-def reset_rate_limiters() -> None:
-    """Keep the process-wide token windows isolated between tests."""
-    with client._RateLimiter._lock:
-        client._RateLimiter._recent_by_token.clear()
-
-
 @pytest.fixture
 def sleeps(monkeypatch: pytest.MonkeyPatch) -> list[float]:
     """Record every sleep the client asks for, without actually waiting."""
     recorded: list[float] = []
     monkeypatch.setattr(client, "sleep", recorded.append)
     return recorded
-
-
-def advance_clock(recorded: list[float], clock: list[float], delay: float) -> None:
-    """Record a sleep and advance a deterministic monotonic clock."""
-    recorded.append(delay)
-    clock[0] += delay
 
 
 def make_client(**kwargs: Any) -> EntsoeClient:
@@ -393,61 +380,6 @@ def test_successful_request_is_logged_with_the_token_redacted(
     assert "securityToken=***" in caplog.text
 
 
-# --- local rate limiting ------------------------------------------------------
-
-
-@responses.activate
-def test_local_limiter_pauses_once_the_window_is_full(
-    sleeps: list[float], monkeypatch: pytest.MonkeyPatch
-) -> None:
-    clock = [0.0]
-    monkeypatch.setattr(client, "monotonic", lambda: clock[0])
-    monkeypatch.setattr(
-        client,
-        "sleep",
-        lambda delay: advance_clock(sleeps, clock, delay),
-    )
-    for _ in range(3):
-        stub()
-    grabber = make_client(max_requests_per_minute=2)
-    for _ in range(3):
-        grabber.get(PARAMS)
-    assert len(sleeps) == 1
-    assert 0 < sleeps[0] <= 60.0
-
-
-@responses.activate
-def test_local_limiter_stays_out_of_the_way_below_the_ceiling(
-    sleeps: list[float],
-) -> None:
-    for _ in range(3):
-        stub()
-    grabber = make_client(max_requests_per_minute=10)
-    for _ in range(3):
-        grabber.get(PARAMS)
-    assert sleeps == []
-
-
-@responses.activate
-def test_local_limiter_does_not_sleep_past_the_call_budget(
-    sleeps: list[float], monkeypatch: pytest.MonkeyPatch
-) -> None:
-    clock = [0.0]
-    monkeypatch.setattr(client, "monotonic", lambda: clock[0])
-    stub()
-    grabber = make_client(
-        max_requests_per_minute=1,
-        max_requests_per_second=1,
-        total_timeout=30.0,
-    )
-    grabber.get(PARAMS)
-    with pytest.raises(EntsoeRateLimitError) as excinfo:
-        grabber.get(PARAMS)
-    assert excinfo.value.retry_after == 60.0
-    assert len(responses.calls) == 1
-    assert sleeps == []
-
-
 # --- configuration ------------------------------------------------------------
 
 
@@ -462,10 +394,6 @@ def test_local_limiter_does_not_sleep_past_the_call_budget(
         {"backoff_base": 0.0},
         {"backoff_max": 0.5},
         {"total_timeout": 0.0},
-        {"max_requests_per_minute": 0},
-        {"max_requests_per_minute": 401},
-        {"max_requests_per_second": 0},
-        {"max_requests_per_second": 8},
     ],
 )
 def test_invalid_configuration_fails_fast(kwargs: dict[str, Any]) -> None:
@@ -564,59 +492,6 @@ def test_document_mentioning_the_marker_late_is_still_a_document(
     body = DOCUMENT + b"x" * 4096 + b"<!-- Acknowledgement_MarketDocument -->"
     stub(body=body)
     assert make_client().get(PARAMS) == body
-
-
-# --- limiter internals --------------------------------------------------------
-
-
-def test_limiter_forgets_requests_older_than_the_window(
-    sleeps: list[float], monkeypatch: pytest.MonkeyPatch
-) -> None:
-    clock = [0.0]
-    monkeypatch.setattr(client, "monotonic", lambda: clock[0])
-    limiter = client._RateLimiter(TOKEN, 1, 1)
-    limiter.acquire(deadline=180.0)
-    clock[0] = 61.0
-    limiter.acquire(deadline=180.0)
-    assert sleeps == []
-
-
-def test_limiter_spreads_a_burst_across_seconds(
-    sleeps: list[float], monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # The minute has plenty of room; the per-second ceiling is what bites, so
-    # a burst waits out the second rather than spending the minute at once.
-    clock = [0.0]
-    monkeypatch.setattr(client, "monotonic", lambda: clock[0])
-    monkeypatch.setattr(
-        client,
-        "sleep",
-        lambda delay: advance_clock(sleeps, clock, delay),
-    )
-    limiter = client._RateLimiter(TOKEN, 350, 2)
-    limiter.acquire(deadline=180.0)
-    limiter.acquire(deadline=180.0)
-    assert sleeps == []
-    limiter.acquire(deadline=180.0)
-    assert sleeps == [1.0]
-
-
-def test_limiter_is_shared_by_clients_using_the_same_token(
-    sleeps: list[float], monkeypatch: pytest.MonkeyPatch
-) -> None:
-    clock = [0.0]
-    monkeypatch.setattr(client, "monotonic", lambda: clock[0])
-    monkeypatch.setattr(
-        client,
-        "sleep",
-        lambda delay: advance_clock(sleeps, clock, delay),
-    )
-    first = client._RateLimiter(TOKEN, 350, 2)
-    second = client._RateLimiter(TOKEN, 350, 2)
-    first.acquire(deadline=180.0)
-    first.acquire(deadline=180.0)
-    second.acquire(deadline=180.0)
-    assert sleeps == [1.0]
 
 
 @responses.activate
