@@ -3,12 +3,12 @@
 The platform serves market data as XML documents from a single endpoint,
 selected entirely by query parameters. This module owns the transport concerns
 -- authentication, timeouts, retries and rate-limit responses -- and hands back
-the response body untouched. Parsing belongs elsewhere.
+validated XML bytes. Domain parsing belongs elsewhere.
 
 Two shapes of body are normal on success. Most queries answer with an XML
 market document; queries whose result set the platform considers too large
-answer with a ZIP archive instead, recognisable by its ``PK`` magic bytes.
-:meth:`EntsoeClient.get` returns both unchanged.
+answer with a ZIP archive containing one or more XML documents.
+:meth:`EntsoeClient.get` normalizes both shapes to a tuple of XML byte strings.
 """
 
 import logging
@@ -17,18 +17,22 @@ import re
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
+from io import BytesIO
 from math import isfinite
 from time import monotonic, sleep
 from types import TracebackType
 from typing import Self
 from urllib.parse import urlsplit
 from xml.etree import ElementTree
+from zipfile import BadZipFile, LargeZipFile, ZipFile, is_zipfile
 
 import requests
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_BASE_URL = "https://web-api.tp.entsoe.eu/api"
+
+type XmlDocuments = tuple[bytes, ...]
 
 # Reason code returned for both empty results and rejected requests. The HTTP
 # status disambiguates it: 200 means no data, while 400 means an invalid query.
@@ -71,8 +75,8 @@ class EntsoeConnectionError(EntsoeTransientError):
 class EntsoeServerError(EntsoeTransientError):
     """The platform timed out, answered 5xx, or returned an unusable success.
 
-    Includes scheduled maintenance, which serves an HTML page rather than a
-    market document.
+    Unusable successes include empty or HTML bodies, malformed XML, and ZIP
+    archives that are invalid, empty, or contain anything other than XML.
     """
 
 
@@ -191,6 +195,64 @@ def _retry_after_seconds(value: str | None) -> float | None:
     return max(0.0, (when - datetime.now(UTC)).total_seconds())
 
 
+def _xml_documents(content: bytes) -> XmlDocuments:
+    """Return well-formed XML documents from an XML body or ZIP archive."""
+    source = BytesIO(content)
+    names: tuple[str, ...]
+
+    if is_zipfile(source):
+        source.seek(0)
+        try:
+            with ZipFile(source) as archive:
+                members = tuple(
+                    info for info in archive.infolist() if not info.is_dir()
+                )
+                if not members:
+                    raise EntsoeServerError(
+                        "HTTP 200: ZIP archive contains no XML documents"
+                    )
+                invalid = tuple(
+                    info.filename
+                    for info in members
+                    if not info.filename.lower().endswith(".xml")
+                )
+                if invalid:
+                    raise EntsoeServerError(
+                        "HTTP 200: ZIP archive contains non-XML content: "
+                        + ", ".join(invalid)
+                    )
+                names = tuple(info.filename for info in members)
+                documents = tuple(archive.read(info) for info in members)
+        except EntsoeServerError:
+            raise
+        except (BadZipFile, LargeZipFile, OSError, RuntimeError, ValueError) as exc:
+            raise EntsoeServerError(
+                f"HTTP 200: unusable ZIP archive ({type(exc).__name__})"
+            ) from None
+    else:
+        names = ("response body",)
+        documents = (content,)
+
+    for name, document in zip(names, documents, strict=True):
+        try:
+            ElementTree.fromstring(document)
+        except ElementTree.ParseError as exc:
+            raise EntsoeServerError(
+                f"HTTP 200: {name} is not well-formed XML: {exc}"
+            ) from None
+
+        reason = _acknowledgement_reason(document)
+        if reason is None:
+            continue
+        code, text = reason
+        message = f"HTTP 200: ENTSO-E returned no document (reason {code}): {text}"
+        if code == _NO_MATCHING_DATA_CODE:
+            raise NoMatchingDataError(message, code, text)
+        raise EntsoeRequestError(message, code, text)
+
+    return documents
+
+
 def _check(response: requests.Response) -> bytes:
     """Return the body, or raise the error the response describes.
 
@@ -252,7 +314,12 @@ def _check(response: requests.Response) -> bytes:
 
 
 class EntsoeClient:
-    """Downloads documents from the ENTSO-E Transparency Platform.
+    """Download validated XML documents from the ENTSO-E Transparency Platform.
+
+    The platform may answer with one XML document or a ZIP archive containing
+    several. :meth:`get` normalizes both forms to an immutable tuple of XML byte
+    strings. Archives are read in memory, and no response is returned unless
+    every document is well-formed XML.
 
     Parameters
     ----------
@@ -326,32 +393,35 @@ class EntsoeClient:
         self._backoff_max = backoff_max
         self._total_timeout = total_timeout
 
-    def get(self, params: Mapping[str, str]) -> bytes:
-        """Fetch one document, retrying transient failures.
+    def get(self, params: Mapping[str, str]) -> XmlDocuments:
+        """Fetch and validate all XML documents for one API query.
 
         Parameters
         ----------
         params
-            Query parameters describing the document. The security token is
+            Query parameters describing the requested documents. The token is
             added here; do not pass it in.
 
         Returns
         -------
-        bytes
-            The response body verbatim: an XML market document, or a ZIP
-            archive when the platform judged the result set too large.
+        tuple of bytes
+            One or more well-formed XML byte strings in response order. Direct
+            XML produces one item; ZIP content produces one item per member.
 
         Raises
         ------
         EntsoeTransientError
-            Connection failure, 408, 5xx, or empty 200 that survived every
-            attempt; a 429 is retried only when it named a ``Retry-After``.
+            A connection failure, 408, 5xx, or unusable HTTP 200 response that
+            survived every attempt. Unusable responses include empty, HTML, or
+            malformed bodies and invalid or non-XML ZIP content. A 429 is
+            retried only when it provides a usable ``Retry-After`` value.
         EntsoeAuthError
             The token was rejected.
         NoMatchingDataError
             The query was valid but matched no data.
         EntsoeRequestError
-            The query itself was rejected.
+            The query was rejected or the platform returned another negative
+            acknowledgement.
         """
         query = {**params, "securityToken": self._token}
         return self._request_with_retries(query)
@@ -373,7 +443,7 @@ class EntsoeClient:
         """Close the session on leaving the context."""
         self.close()
 
-    def _request_with_retries(self, query: Mapping[str, str]) -> bytes:
+    def _request_with_retries(self, query: Mapping[str, str]) -> XmlDocuments:
         """Run one logical request within its attempt and time budgets."""
         deadline = monotonic() + self._total_timeout
 
@@ -399,7 +469,7 @@ class EntsoeClient:
 
         raise AssertionError("retry loop exhausted without returning or raising")
 
-    def _request_once(self, query: Mapping[str, str]) -> bytes:
+    def _request_once(self, query: Mapping[str, str]) -> XmlDocuments:
         """Perform one request and classify its outcome."""
         try:
             response = self._session.get(
@@ -430,7 +500,7 @@ class EntsoeClient:
                 response.status_code,
                 len(response.content),
             )
-            return _check(response)
+            return _xml_documents(_check(response))
         raise error from None
 
     def _retry_delay(self, attempt: int, error: EntsoeTransientError) -> float:

@@ -1,7 +1,9 @@
 import logging
 from datetime import UTC, datetime, timedelta
 from email.utils import format_datetime
+from io import BytesIO
 from typing import Any
+from zipfile import ZipFile
 
 import pytest
 import requests
@@ -33,6 +35,7 @@ DOCUMENT = (
     b'<Publication_MarketDocument xmlns="urn:iec62325.351:tc57wg16:451-3:'
     b'publicationdocument:7:0"><mRID>abc</mRID></Publication_MarketDocument>'
 )
+SECOND_DOCUMENT = DOCUMENT.replace(b"<mRID>abc</mRID>", b"<mRID>def</mRID>")
 
 
 def acknowledgement(code: str, text: str) -> bytes:
@@ -43,6 +46,15 @@ def acknowledgement(code: str, text: str) -> bytes:
         f"<code>{code}</code><text>{text}</text>"
         "</Reason></Acknowledgement_MarketDocument>"
     ).encode()
+
+
+def zip_body(files: dict[str, bytes]) -> bytes:
+    """Build an in-memory ZIP response for a test."""
+    buffer = BytesIO()
+    with ZipFile(buffer, "w") as archive:
+        for name, content in files.items():
+            archive.writestr(name, content)
+    return buffer.getvalue()
 
 
 # Trimmed from the live response of web-api.tp.entsoe.eu on 2026-09-01: a 5xx
@@ -82,9 +94,9 @@ def stub(
 
 
 @responses.activate
-def test_returns_the_document_body_verbatim(sleeps: list[float]) -> None:
+def test_returns_direct_xml_as_one_document(sleeps: list[float]) -> None:
     stub()
-    assert make_client().get(PARAMS) == DOCUMENT
+    assert make_client().get(PARAMS) == (DOCUMENT,)
     assert sleeps == []
 
 
@@ -99,10 +111,39 @@ def test_sends_the_token_as_a_query_parameter(sleeps: list[float]) -> None:
 
 
 @responses.activate
-def test_zip_payload_is_returned_untouched(sleeps: list[float]) -> None:
-    archive = b"PK\x03\x04" + b"\x00" * 32
-    stub(body=archive)
-    assert make_client().get(PARAMS) == archive
+def test_zip_payload_is_unpacked_into_xml_documents(sleeps: list[float]) -> None:
+    stub(body=zip_body({"first.xml": DOCUMENT, "nested/second.XML": SECOND_DOCUMENT}))
+    assert make_client().get(PARAMS) == (DOCUMENT, SECOND_DOCUMENT)
+
+
+@responses.activate
+def test_non_xml_http_200_is_retried_as_a_server_failure(
+    sleeps: list[float],
+) -> None:
+    stub(body=b'{"status":"ok"}', headers={"Content-Type": "application/json"})
+    with pytest.raises(EntsoeServerError, match="not well-formed XML"):
+        make_client(max_attempts=1).get(PARAMS)
+
+
+@responses.activate
+def test_zip_with_non_xml_content_is_rejected(sleeps: list[float]) -> None:
+    stub(body=zip_body({"document.xml": DOCUMENT, "readme.txt": b"not XML"}))
+    with pytest.raises(EntsoeServerError, match="non-XML content"):
+        make_client(max_attempts=1).get(PARAMS)
+
+
+@responses.activate
+def test_zip_with_malformed_xml_is_rejected(sleeps: list[float]) -> None:
+    stub(body=zip_body({"broken.xml": b"<Publication_MarketDocument>"}))
+    with pytest.raises(EntsoeServerError, match="not well-formed XML"):
+        make_client(max_attempts=1).get(PARAMS)
+
+
+@responses.activate
+def test_empty_zip_is_rejected(sleeps: list[float]) -> None:
+    stub(body=zip_body({}))
+    with pytest.raises(EntsoeServerError, match="contains no XML documents"):
+        make_client(max_attempts=1).get(PARAMS)
 
 
 # --- acknowledgement documents ------------------------------------------------
@@ -197,7 +238,7 @@ def test_rate_limit_with_retry_after_is_retried_then_succeeds(
 ) -> None:
     stub(body=b"", status=429, headers={"Retry-After": "5"})
     stub()
-    assert make_client().get(PARAMS) == DOCUMENT
+    assert make_client().get(PARAMS) == (DOCUMENT,)
     assert len(responses.calls) == 2
     assert sleeps == [5.0]
 
@@ -297,7 +338,7 @@ def test_empty_http_200_is_retried_as_a_server_failure(sleeps: list[float]) -> N
 def test_http_408_is_retried_as_a_server_failure(sleeps: list[float]) -> None:
     stub(body=b"request timed out", status=408)
     stub()
-    assert make_client().get(PARAMS) == DOCUMENT
+    assert make_client().get(PARAMS) == (DOCUMENT,)
     assert len(responses.calls) == 2
     assert len(sleeps) == 1
 
@@ -320,7 +361,7 @@ def test_read_timeout_is_treated_as_transient(sleeps: list[float]) -> None:
         responses.GET, DEFAULT_BASE_URL, body=requests.ReadTimeout("too slow")
     )
     stub()
-    assert make_client().get(PARAMS) == DOCUMENT
+    assert make_client().get(PARAMS) == (DOCUMENT,)
 
 
 # --- the token must not leak --------------------------------------------------
@@ -489,9 +530,16 @@ def test_document_mentioning_the_marker_late_is_still_a_document(
 ) -> None:
     # The sniff only looks at the head of the body, so a market document that
     # happens to quote the word further down is not misread as an error.
-    body = DOCUMENT + b"x" * 4096 + b"<!-- Acknowledgement_MarketDocument -->"
+    closing_tag = b"</Publication_MarketDocument>"
+    body = DOCUMENT.replace(
+        closing_tag,
+        b"<note>"
+        + b"x" * 4096
+        + b"Acknowledgement_MarketDocument</note>"
+        + closing_tag,
+    )
     stub(body=body)
-    assert make_client().get(PARAMS) == body
+    assert make_client().get(PARAMS) == (body,)
 
 
 @responses.activate
