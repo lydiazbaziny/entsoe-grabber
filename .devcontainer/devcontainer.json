@@ -39,7 +39,7 @@
     // and only this reference is committed. Set it in your host shell profile,
     // then rebuild the container. The deployed Lambda never reads this -- it
     // takes the token from SSM Parameter Store.
-    "ENTSOE_SECURITY_TOKEN": "${localEnv:ENTSOE_SECURITY_TOKEN}",
+    "ENTSOE_SECURITY_TOKEN": "${localEnv:ENTSOE_SECURITY_TOKEN_PROD}",
     // The .claude volume below persists credentials and settings, but Claude
     // Code keeps its onboarding state -- theme, the logged-in account, the
     // per-folder trust prompt -- in $HOME/.claude.json, which sits beside
