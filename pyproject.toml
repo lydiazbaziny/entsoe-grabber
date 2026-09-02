@@ -48,7 +48,11 @@ lint.pydocstyle.convention = "numpy"
 ini_options.minversion = "6.0"
 ini_options.testpaths = [ "tests" ]
 ini_options.pythonpath = [ "src" ]
-ini_options.addopts = "-q --strict-markers"
+# Smoke tests reach the live IOP platform, so they are deselected by default:
+# `make test` and `make check` must stay offline and deterministic. `make smoke`
+# passes its own -m, which overrides this one.
+ini_options.addopts = "-q --strict-markers -m 'not smoke'"
+ini_options.markers = [ "smoke: live test against the ENTSO-E IOP environment" ]
 
 [tool.coverage]
 run.branch = true
