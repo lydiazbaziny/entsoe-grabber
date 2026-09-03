@@ -187,7 +187,7 @@ def test_attributes_become_their_own_columns() -> None:
     assert row["TimeSeries/MktPSRType/PowerSystemResources/nominalP@unit"] == "MAW"
 
 
-def test_an_attribute_on_a_container_survives_too() -> None:
+def test_an_attribute_on_the_record_path_survives_too() -> None:
     # No current ENTSO-E schema puts an attribute on TimeSeries, Period or
     # Point. The claim is that everything on the path reaches the row, so a
     # document that did would not lose it.
@@ -216,6 +216,25 @@ def test_repeated_collapsed_siblings_are_numbered() -> None:
     assert row["Reason[2]/code"] == "B18"
 
 
+def test_a_withdrawn_series_does_not_claim_a_live_one_s_columns() -> None:
+    # MoP figure 16: a withdrawn series carries no Period, so it sits off the
+    # record path while its live sibling is on it. Both are called TimeSeries.
+    mixed = document(
+        HEADER + "<TimeSeries><mRID>live</mRID>"
+        "<Period><resolution>PT60M</resolution>"
+        "<Point><position>1</position><quantity>111</quantity></Point>"
+        "</Period></TimeSeries>"
+        "<TimeSeries><mRID>withdrawn</mRID><cancelledTS>A09</cancelledTS>"
+        "</TimeSeries>"
+    )
+
+    row = rows((mixed,))[0]
+
+    assert row["TimeSeries/mRID"] == "live"
+    assert row["TimeSeries[2]/mRID"] == "withdrawn"
+    assert row["TimeSeries[2]/cancelledTS"] == "A09"
+
+
 def test_a_series_is_not_numbered_because_it_gets_rows_not_columns() -> None:
     header = columns((PER_UNIT,))
 
@@ -233,17 +252,19 @@ def test_a_document_without_points_still_records_itself() -> None:
     assert result[0]["TimeSeries/cancelledTS"] == "A09"
 
 
-def test_no_documents_still_produces_a_header() -> None:
-    assert to_csv(()).decode("utf-8").splitlines() == ["document"]
+def test_no_documents_produces_an_empty_body() -> None:
+    assert to_csv(()) == b""
 
 
 # --- more than one document per response -------------------------------------
 
 
-def test_rows_name_the_document_they_came_from() -> None:
-    indexes = [row["document"] for row in rows((FORECAST, PER_UNIT))]
+def test_rows_carry_the_id_of_the_document_they_came_from() -> None:
+    # Every MarketDocument carries a required mRID, so rows stay attributable
+    # to their source without the serializer inventing an index column.
+    ids = [row["mRID"] for row in rows((FORECAST, PER_UNIT))]
 
-    assert indexes == ["0", "0", "1", "1"]
+    assert ids == ["7b1f9c", "7b1f9c", "abc", "abc"]
 
 
 def test_the_header_is_the_union_of_every_document() -> None:
@@ -260,5 +281,5 @@ def test_a_column_one_document_lacks_is_left_empty() -> None:
     assert from_per_unit["TimeSeries/curveType"] == ""
 
 
-def test_the_document_column_comes_first() -> None:
-    assert columns((FORECAST,))[0] == "document"
+def test_columns_keep_the_order_the_document_used() -> None:
+    assert columns((FORECAST,))[:3] == ["mRID", "revisionNumber", "type"]
