@@ -5,12 +5,13 @@ smoke"``, so ``make test`` and ``make check`` stay offline and deterministic.
 Run them deliberately with ``make smoke``.
 
 These cover what a mocked test cannot: that the live platform still speaks the
-protocol the client assumes. Two of them are deterministic, and two depend on
+protocol the client assumes. Two of them are deterministic, and three depend on
 IOP holding data. IOP is sparse and its contents change, so the data-dependent
 tests skip rather than fail when a query comes back empty -- an empty result is
 the platform answering correctly, not the client breaking.
 """
 
+import csv
 import os
 from datetime import UTC, datetime, timedelta
 from xml.etree import ElementTree
@@ -24,6 +25,7 @@ from entsoe_grabber.client import (
     NoMatchingDataError,
     XmlDocuments,
 )
+from entsoe_grabber.serializer import to_csv
 
 pytestmark = pytest.mark.smoke
 
@@ -140,6 +142,33 @@ def test_fetches_a_well_formed_market_document(client: EntsoeClient) -> None:
     assert documents
     root = ElementTree.fromstring(documents[0])
     assert root.tag == f"{{{GENERATION_LOAD_NS}}}GL_MarketDocument"
+
+
+def test_a_live_document_serialises_to_rows(client: EntsoeClient) -> None:
+    """A real response flattens into one row per interval, with its quantity.
+
+    The serializer is driven by document structure alone, so the failure it
+    cannot be caught in offline tests is a live document nesting differently
+    from the fixtures. This is the only test that sees platform output.
+    """
+    with client:
+        documents = _fetch(
+            client,
+            {
+                "documentType": "A75",
+                "processType": "A16",
+                "in_Domain": SK_DOMAIN,
+                **_window(1),
+            },
+        )
+
+    rows = list(csv.DictReader(to_csv(documents).decode("utf-8").splitlines()))
+
+    assert rows
+    for row in rows:
+        assert row["TimeSeries/Period/Point/position"]
+        assert row["TimeSeries/Period/Point/quantity"]
+        assert row["TimeSeries/Period/resolution"]
 
 
 def test_zip_response_is_normalized_to_separate_documents(
