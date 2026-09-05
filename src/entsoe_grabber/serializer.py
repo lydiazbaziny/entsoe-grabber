@@ -86,6 +86,34 @@ def _on_record_path(
     return on_path
 
 
+def _collect_record_names(
+    element: ElementTree.Element,
+    names: set[str],
+) -> bool:
+    """Add every name on a path from ``element`` down to a record to ``names``.
+
+    Returns whether ``element`` is itself on such a path, which is how a parent
+    learns it is on one too.
+
+    This is :func:`_on_record_path`'s test run for names rather than elements.
+    Keeping it separate is what stops the pass from building a set of every
+    element in the document only to read the tags off it and drop it again --
+    the names are a handful of strings, and the set of elements is rebuilt
+    against the full name set immediately afterwards regardless.
+    """
+    on_path = False
+    for child in element:
+        # Every child is visited. `any` would stop at the first one that
+        # qualifies and never see the names under its siblings.
+        if _collect_record_names(child, names):
+            on_path = True
+    name = _local_name(element.tag)
+    if on_path or name in _RECORD_TAGS:
+        names.add(name)
+        return True
+    return False
+
+
 def _record_names(root: ElementTree.Element) -> frozenset[str]:
     """Return the names that stand for a record in this document.
 
@@ -101,8 +129,9 @@ def _record_names(root: ElementTree.Element) -> frozenset[str]:
     The names come from the structural pass alone, so an element promoted here
     does not lend its own name to a further round.
     """
-    structural = _on_record_path(root, _RECORD_TAGS)
-    return _RECORD_TAGS | frozenset(_local_name(e.tag) for e in structural)
+    names: set[str] = set()
+    _collect_record_names(root, names)
+    return _RECORD_TAGS | frozenset(names)
 
 
 def _repeated_tags(root: ElementTree.Element) -> frozenset[str]:
