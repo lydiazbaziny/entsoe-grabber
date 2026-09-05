@@ -1,22 +1,38 @@
-"""Turn ENTSO-E XML market documents into CSV.
+"""Turn one ENTSO-E XML market document into CSV.
 
-Every transparency document nests the same way: a market document holds
-``TimeSeries``, each holding ``Period``s, each holding the ``Point``s that carry
-the measurements. This module writes one row per ``Point`` and turns everything
-on the path down to it into columns, so a document type it has never seen still
-produces a usable table, and a field the platform adds appears on its own.
+A market document nests ``TimeSeries``, each holding periods, each holding the
+``Point``s that carry the measurements -- but only the document itself is
+promised. A series withdrawn before publication carries no period, a period the
+platform opened but never filled carries no point, and a document type that
+publishes attributes rather than a curve carries no series at all.
 
-``Point`` is the only element name the module knows. An element that is a
-``Point``, or contains one, lies on the record path: it contributes a segment to
-the column name and is recursed into. Everything else is off that path, and
-collapses into columns wherever it sits.
+So the row is not fixed at one level. Every branch produces rows at the deepest
+level it reaches on its own: a series that reaches its points contributes one
+row per point, a series that stops at itself contributes a single row with the
+period and point columns left empty. Siblings of differing depth land in the
+same columns rather than in column families of their own, and no series is
+repeated onto rows belonging to another -- the flattening a ``LEFT JOIN`` gives
+a parent with no children.
+
+An element is a record when it is named ``TimeSeries``, ``Period`` or
+``Point``, or when it contains one. The second half matters: unavailability
+documents nest their points inside ``Available_Period``, a name this module
+does not know, and containment carries the rows through it anyway. A name that
+earns record standing that way keeps it for the whole document, so an
+``Available_Period`` holding no point still takes a row beside a sibling that
+holds some, the way ``Period`` does on its name alone. A record contributes a
+segment to the column name and is recursed into; everything else is off the
+record path and collapses into columns wherever it sits.
 
 Columns are named by their namespace-stripped XPath relative to the document
 root -- ``TimeSeries/Period/Point/quantity``. The separator is ``/`` rather than
 ``.`` because ENTSO-E already spends the dot inside single element names, as in
 ``process.processType`` and ``inBiddingZone_Domain.mRID``; with both meanings on
 one character a path could not be read back. ``@`` introduces an attribute and
-``[n]`` numbers repeated siblings, following the same XPath conventions.
+``[n]`` numbers siblings, following the same XPath conventions. A tag that
+repeats under any one element is numbered wherever else it appears in that
+document too, so a field one series reports twice and the next reports once
+stays in a single column.
 
 Values are written exactly as the platform sent them. In particular the instant
 a ``Point`` covers is left as its ``position``, which a reader resolves as
@@ -32,11 +48,9 @@ from collections import Counter
 from collections.abc import Iterable, Iterator, Mapping
 from xml.etree import ElementTree
 
-from entsoe_grabber.client import XmlDocuments
-
-# The one element name this module knows. Every document family in the ENTSO-E
-# schema guide that carries measurements ends in Point.
-_RECORD_TAG = "Point"
+# The element names this module knows without looking. :func:`_record_names`
+# adds the ones a document proves to be records, such as ``Available_Period``.
+_RECORD_TAGS = frozenset({"TimeSeries", "Period", "Point"})
 
 
 def _local_name(tag: str) -> str:
@@ -44,54 +58,96 @@ def _local_name(tag: str) -> str:
     return tag.rpartition("}")[2]
 
 
-def _record_path(element: ElementTree.Element) -> set[ElementTree.Element]:
-    """Return the elements lying on a path from ``element`` down to a ``Point``.
+def _on_record_path(
+    element: ElementTree.Element,
+    record_names: frozenset[str],
+) -> set[ElementTree.Element]:
+    """Return every element lying on a path from ``element`` down to a record.
 
-    That is every element of this subtree that is, or contains, a ``Point``,
-    ``element`` included when it qualifies -- and the empty set when the subtree
-    holds no ``Point`` at all. :func:`_walk` reads it as a membership test: a
-    child on the path becomes a segment of the column name and is recursed into,
-    a child off it is collapsed into columns.
+    An element qualifies when its name is in ``record_names`` or when it holds
+    something that does; the result is empty when the subtree holds no record.
+    :func:`_walk` uses it as a membership test: a child in the set becomes a
+    segment of the column name and is recursed into, a child outside it
+    collapses into columns.
 
-    Identity, not equality, decides membership: ``Element`` defines neither
-    ``__eq__`` nor ``__hash__``, so two points that happen to carry the same
-    position and quantity stay two entries and produce two rows. A set rather
-    than a list because the walk tests every child against it, which on a list
-    would make the walk quadratic.
+    A record needs no record beneath it, which is what gives a withdrawn series
+    a row of its own instead of columns repeated onto its live siblings' rows,
+    and why the deepest level reached is settled per branch.
 
-    One post-order pass. A non-empty result from a child is itself the answer to
-    "does this element hold a ``Point``", which is why nothing else is tracked.
+    Membership is by identity, since ``Element`` defines no ``__eq__``: two
+    points carrying the same values stay two entries and produce two rows. A
+    set, not a list, so the walk's per-child test stays O(1).
     """
     on_path: set[ElementTree.Element] = set()
     for child in element:
-        on_path |= _record_path(child)
-    if on_path or _local_name(element.tag) == _RECORD_TAG:
+        on_path |= _on_record_path(child, record_names)
+    if on_path or _local_name(element.tag) in record_names:
         on_path.add(element)
     return on_path
 
 
+def _record_names(root: ElementTree.Element) -> frozenset[str]:
+    """Return the names that stand for a record in this document.
+
+    The three the module knows, plus every name that earned the standing by
+    holding a record -- ``Available_Period`` in an unavailability document,
+    which the module has never heard of.
+
+    Applying those names to the whole document is what makes the rule
+    symmetric: an ``Available_Period`` holding no point still takes a row
+    beside a sibling that holds some, instead of collapsing into columns that
+    ride on the other period's rows.
+
+    The names come from the structural pass alone, so an element promoted here
+    does not lend its own name to a further round.
+    """
+    structural = _on_record_path(root, _RECORD_TAGS)
+    return _RECORD_TAGS | frozenset(_local_name(e.tag) for e in structural)
+
+
+def _repeated_tags(root: ElementTree.Element) -> frozenset[str]:
+    """Return every tag name carried more than once by any one element.
+
+    Numbering is settled for the document rather than parent by parent.
+    Whether a tag repeats is a property of the schema -- ``Reason`` is
+    ``0..*``, ``mRID`` is not -- and one parent is too small a sample to read it
+    from: a series carrying two reasons beside one carrying a single reason says
+    nothing about the field.
+
+    It runs before the walk, since a name given on the way down cannot be
+    revised by a repeat found later.
+    """
+    repeated: set[str] = set()
+    for element in root.iter():
+        counts = Counter(_local_name(child.tag) for child in element)
+        repeated.update(name for name, count in counts.items() if count > 1)
+    return frozenset(repeated)
+
+
 def _numbered(
     element: ElementTree.Element,
+    repeated_tags: frozenset[str],
 ) -> Iterator[tuple[str, ElementTree.Element]]:
     """Pair each child of ``element`` with its column name.
 
-    A tag carried by one child keeps its bare name, the normal case; repeats
-    become ``Reason[1]`` and ``Reason[2]`` rather than overwriting each other.
+    A tag in ``repeated_tags`` is numbered -- ``Reason[1]``, ``Reason[2]`` --
+    and every other keeps its bare name. Numbering a tag everywhere it appears,
+    not only where it repeats, keeps one field in one column: a series with a
+    single reason writes ``Reason[1]/code`` beside a series with two, rather
+    than opening a ``Reason/code`` of its own.
 
     Every child is counted, including the ones on the record path that the
-    caller names bare. A withdrawn ``TimeSeries`` carries no ``Period``, so it
-    sits off the path beside a live sibling that is on it; counting only the
-    off-path children would hand it the bare name the live one's rows use.
+    caller names bare, so an off-path child keeps its true position among its
+    siblings.
 
     XML forbids ``[`` in a name, so a numbered name cannot collide with a real
     element.
     """
-    names = [_local_name(child.tag) for child in element]
-    counts = Counter(names)
     seen: Counter[str] = Counter()
-    for name, child in zip(names, element, strict=True):
+    for child in element:
+        name = _local_name(child.tag)
         seen[name] += 1
-        yield (name if counts[name] == 1 else f"{name}[{seen[name]}]"), child
+        yield (f"{name}[{seen[name]}]" if name in repeated_tags else name), child
 
 
 def _join(path: str, name: str) -> str:
@@ -107,59 +163,59 @@ def _join(path: str, name: str) -> str:
 def _walk(
     element: ElementTree.Element,
     path: str,
-    record_path: set[ElementTree.Element],
+    on_record_path: set[ElementTree.Element],
+    repeated_tags: frozenset[str],
 ) -> Iterator[dict[str, str]]:
-    """Yield one row per ``Point`` beneath ``element``.
+    """Yield one row per record beneath ``element``.
 
-    A subtree holding no ``Point`` is itself one record. That is what lets a
-    single recursion do all the work: an element off the record path yields
-    exactly one set of values, which the parent folds into its own, while an
-    element on the path yields a row per ``Point`` below and the parent merges
-    its values onto each. Both cases are the same descent, building column names
-    on the way down and values on the way up.
+    A subtree holding no record counts as one record, which lets a single
+    recursion cover both cases: an off-path element yields one set of values
+    that its parent folds in, an on-path element yields a row per record below
+    and its parent merges its own values onto each. Column names are built on
+    the way down, values on the way up.
 
-    ``own_values`` is what this element contributes to every row beneath it: its
-    own text, its attributes, and everything gathered from the children that
-    lead nowhere. An element with no children left on the record path is the
-    record itself, and its own values are the row.
+    ``values`` is what this element contributes to every row beneath it: its
+    text, its attributes, and everything gathered from children leading to no
+    record. With no children left on the record path, those values are the row.
 
-    ``path`` is threaded down rather than reconstructed on the way up because
-    naming a column is a prefix operation: growing the prefix as the walk
-    descends costs one concatenation per element, while renaming rows as they
+    ``path`` is threaded down rather than rebuilt on the way up: growing a
+    prefix costs one concatenation per element, while renaming rows as they
     surface would rewrite every key at every level.
     """
-    own_values: dict[str, str] = {}
+    values: dict[str, str] = {}
     text = (element.text or "").strip()
     if text:
-        own_values[path] = text
+        values[path] = text
     for attribute, value in element.attrib.items():
-        own_values[f"{path}@{_local_name(attribute)}"] = value
+        values[f"{path}@{_local_name(attribute)}"] = value
 
-    on_path: list[ElementTree.Element] = []
-    for name, child in _numbered(element):
-        if child in record_path:
-            # Named bare below, not by the number just computed: numbering these
-            # would give each TimeSeries its own columns instead of its own rows.
-            on_path.append(child)
+    children_on_path: list[ElementTree.Element] = []
+    for name, child in _numbered(element, repeated_tags):
+        if child in on_record_path:
+            # Named bare below, not by the number just computed: numbering
+            # these would give each TimeSeries columns instead of rows.
+            children_on_path.append(child)
             continue
-        for row in _walk(child, _join(path, name), record_path):
-            own_values.update(row)
+        for row in _walk(child, _join(path, name), on_record_path, repeated_tags):
+            values.update(row)
 
-    if not on_path:
-        yield own_values
+    if not children_on_path:
+        yield values
         return
-    for child in on_path:
-        for row in _walk(child, _join(path, _local_name(child.tag)), record_path):
-            yield own_values | row
+    for child in children_on_path:
+        for row in _walk(
+            child, _join(path, _local_name(child.tag)), on_record_path, repeated_tags
+        ):
+            yield values | row
 
 
 def _render_csv(columns: Iterable[str], rows: Iterable[Mapping[str, str]]) -> bytes:
     """Render ``rows`` as a UTF-8 CSV body with ``columns`` as its header.
 
-    A row saying nothing about a column leaves that cell empty rather than
-    shifting the row, which is what keeps documents of differing shape in one
-    rectangular table. With no columns there is nothing to name, so the body is
-    empty rather than a lone blank line.
+    A value a row does not carry is written as an empty cell rather than
+    shifting the row along, which is what keeps records of differing shape in
+    one rectangular table. No columns means nothing to write at all, so the
+    result is empty rather than a stray newline.
     """
     fieldnames = list(columns)
     if not fieldnames:
@@ -171,37 +227,38 @@ def _render_csv(columns: Iterable[str], rows: Iterable[Mapping[str, str]]) -> by
     return buffer.getvalue().encode("utf-8")
 
 
-def to_csv(documents: XmlDocuments) -> bytes:
-    """Serialise ``documents`` into a single CSV body.
+def to_csv(document: bytes) -> bytes:
+    """Serialise one XML market document into a CSV body.
+
+    One document per call, deliberately. A response can carry several -- a ZIP
+    archive delivers one per member -- and they need not agree on shape, so one
+    header for all of them would invent columns for records that never had
+    them. It also keeps one document's rows in memory at a time.
 
     Parameters
     ----------
-    documents
-        Well-formed XML documents, as returned by
+    document
+        A well-formed XML document, as returned by
         :meth:`~entsoe_grabber.client.EntsoeClient.get`.
 
     Returns
     -------
     bytes
-        UTF-8 CSV: a header row followed by one row per ``Point``. The header is
-        the union of the columns found, in the order they first appeared, so a
-        response whose documents differ still produces one rectangular table
-        with empty cells where a document said nothing. A document carrying no
-        ``Point`` at all -- a cancelled time series, a registry document --
-        still contributes one fully collapsed row, so nothing goes unrecorded.
-        No documents produces an empty body.
-
-        Rows from several documents -- a ZIP archive delivers one per member --
-        follow each other in response order, and the document's own required
-        ``mRID`` column says which one a row came from.
+        UTF-8 CSV: a header row, then one row per record. A branch reaching
+        its points gives a row per point; one stopping at a period or at the
+        series gives a single row with the deeper columns empty; a document
+        with no series is one collapsed row. Nothing goes unrecorded. The
+        header is the union of the columns found, in first-seen order, with
+        empty cells where a record said nothing.
     """
+    root = ElementTree.fromstring(document)
+    on_record_path = _on_record_path(root, _record_names(root))
+    repeated_tags = _repeated_tags(root)
+
     columns: dict[str, None] = {}
     rows: list[dict[str, str]] = []
-
-    for document in documents:
-        root = ElementTree.fromstring(document)
-        for row in _walk(root, "", _record_path(root)):
-            columns.update(dict.fromkeys(row))
-            rows.append(row)
+    for row in _walk(root, "", on_record_path, repeated_tags):
+        columns.update(dict.fromkeys(row))
+        rows.append(row)
 
     return _render_csv(columns, rows)

@@ -149,7 +149,9 @@ def test_a_live_document_serialises_to_rows(client: EntsoeClient) -> None:
 
     The serializer is driven by document structure alone, so the failure it
     cannot be caught in offline tests is a live document nesting differently
-    from the fixtures. This is the only test that sees platform output.
+    from the fixtures. A query for realised generation reaches Point, so these
+    rows also confirm the deepest level is discovered rather than assumed. This
+    is the only test that sees platform output.
     """
     with client:
         documents = _fetch(
@@ -162,7 +164,11 @@ def test_a_live_document_serialises_to_rows(client: EntsoeClient) -> None:
             },
         )
 
-    rows = list(csv.DictReader(to_csv(documents).decode("utf-8").splitlines()))
+    rows = [
+        row
+        for document in documents
+        for row in csv.DictReader(to_csv(document).decode("utf-8").splitlines())
+    ]
 
     assert rows
     for row in rows:
