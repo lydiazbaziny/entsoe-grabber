@@ -1,9 +1,11 @@
 import logging
+import struct
 from datetime import UTC, datetime, timedelta
 from email.utils import format_datetime
 from io import BytesIO
 from typing import Any
-from zipfile import ZipFile
+from xml.etree import ElementTree
+from zipfile import ZIP_DEFLATED, ZIP_STORED, ZipFile
 
 import pytest
 import requests
@@ -48,13 +50,23 @@ def acknowledgement(code: str, text: str) -> bytes:
     ).encode()
 
 
-def zip_body(files: dict[str, bytes]) -> bytes:
+def zip_body(files: dict[str, bytes], *, compression: int = ZIP_STORED) -> bytes:
     """Build an in-memory ZIP response for a test."""
     buffer = BytesIO()
-    with ZipFile(buffer, "w") as archive:
+    with ZipFile(buffer, "w", compression=compression) as archive:
         for name, content in files.items():
             archive.writestr(name, content)
     return buffer.getvalue()
+
+
+def corrupt_deflate_zip() -> bytes:
+    """Keep the ZIP directory intact but corrupt the member's DEFLATE stream."""
+    content = bytearray(zip_body({"document.xml": DOCUMENT}, compression=ZIP_DEFLATED))
+    name_length, extra_length = struct.unpack_from("<HH", content, 26)
+    # The local header has 30 fixed bytes, then the filename and extra fields.
+    # 0b111 is a final DEFLATE block with the reserved (invalid) block type.
+    content[30 + name_length + extra_length] = 0b111
+    return bytes(content)
 
 
 # Trimmed from the live response of web-api.tp.entsoe.eu on 2026-09-01: a 5xx
@@ -111,9 +123,51 @@ def test_sends_the_token_as_a_query_parameter(sleeps: list[float]) -> None:
 
 
 @responses.activate
-def test_zip_payload_is_unpacked_into_xml_documents(sleeps: list[float]) -> None:
-    stub(body=zip_body({"first.xml": DOCUMENT, "nested/second.XML": SECOND_DOCUMENT}))
+@pytest.mark.parametrize("compression", [ZIP_STORED, ZIP_DEFLATED])
+def test_zip_payload_is_unpacked_into_xml_documents(
+    sleeps: list[float], compression: int
+) -> None:
+    stub(
+        body=zip_body(
+            {"first.xml": DOCUMENT, "nested/second.XML": SECOND_DOCUMENT},
+            compression=compression,
+        )
+    )
     assert make_client().get(PARAMS) == (DOCUMENT, SECOND_DOCUMENT)
+
+
+@responses.activate
+def test_archive_member_name_does_not_determine_its_document_type(
+    sleeps: list[float],
+) -> None:
+    stub(
+        body=zip_body(
+            {"Acknowledgement_MarketDocument.xml": DOCUMENT}, compression=ZIP_DEFLATED
+        )
+    )
+
+    assert make_client().get(PARAMS) == (DOCUMENT,)
+
+
+@responses.activate
+def test_corrupt_deflate_is_retried_then_succeeds(sleeps: list[float]) -> None:
+    stub(body=corrupt_deflate_zip())
+    stub()
+
+    assert make_client().get(PARAMS) == (DOCUMENT,)
+    assert len(responses.calls) == 2
+    assert len(sleeps) == 1
+
+
+@responses.activate
+def test_corrupt_deflate_raises_server_error_after_retries(sleeps: list[float]) -> None:
+    stub(body=corrupt_deflate_zip())
+
+    with pytest.raises(EntsoeServerError, match="unusable ZIP archive"):
+        make_client().get(PARAMS)
+
+    assert len(responses.calls) == 3
+    assert len(sleeps) == 2
 
 
 @responses.activate
@@ -162,8 +216,39 @@ def test_reason_999_on_http_200_raises_no_matching_data(
 
 
 @responses.activate
-def test_reason_999_on_http_400_is_an_invalid_request(sleeps: list[float]) -> None:
-    stub(body=acknowledgement("999", "Invalid query attributes"), status=400)
+@pytest.mark.parametrize("archived", [False, True])
+@pytest.mark.parametrize("representation", ["utf16", "leading_comment", "prefix"])
+def test_acknowledgement_detection_uses_parsed_xml(
+    sleeps: list[float], archived: bool, representation: str
+) -> None:
+    body = acknowledgement("999", "No matching data found")
+    if representation == "utf16":
+        body = body.decode().replace("UTF-8", "UTF-16").encode("utf-16")
+    elif representation == "leading_comment":
+        body = body.replace(b"?>", b"?>\n<!--" + b"x" * 4096 + b"-->", 1)
+    else:
+        body = ElementTree.tostring(ElementTree.fromstring(body))
+    if archived:
+        body = zip_body({"acknowledgement.xml": body}, compression=ZIP_DEFLATED)
+    stub(body=body)
+
+    with pytest.raises(NoMatchingDataError) as excinfo:
+        make_client().get(PARAMS)
+
+    assert excinfo.value.code == "999"
+    assert excinfo.value.text == "No matching data found"
+    assert len(responses.calls) == 1
+    assert sleeps == []
+
+
+@responses.activate
+@pytest.mark.parametrize("encoding", ["utf-8", "utf-16"])
+def test_reason_999_on_http_400_is_an_invalid_request(
+    sleeps: list[float], encoding: str
+) -> None:
+    body = acknowledgement("999", "Invalid query attributes")
+    body = body.decode().replace("UTF-8", encoding).encode(encoding)
+    stub(body=body, status=400)
     with pytest.raises(EntsoeRequestError) as excinfo:
         make_client().get(PARAMS)
     assert not isinstance(excinfo.value, NoMatchingDataError)
@@ -295,6 +380,55 @@ def test_retry_after_longer_than_the_budget_fails_fast(sleeps: list[float]) -> N
         make_client(total_timeout=30.0).get(PARAMS)
     assert len(responses.calls) == 1
     assert sleeps == []
+
+
+@responses.activate
+@pytest.mark.parametrize("status", [200, 503])
+def test_retry_budget_does_not_interrupt_an_in_flight_request(
+    sleeps: list[float], monkeypatch: pytest.MonkeyPatch, status: int
+) -> None:
+    elapsed = [0.0]
+    monkeypatch.setattr(client, "monotonic", lambda: elapsed[0])
+
+    def slow_response(
+        request: requests.PreparedRequest,
+    ) -> tuple[int, dict[str, str], bytes]:
+        # Model a download finishing after the retry budget. A valid response
+        # remains useful; a failure must not schedule another request.
+        elapsed[0] = 31.0
+        return status, {}, DOCUMENT if status == 200 else b"unavailable"
+
+    responses.add_callback(responses.GET, DEFAULT_BASE_URL, callback=slow_response)
+    grabber = make_client(total_timeout=30.0)
+    if status == 200:
+        assert grabber.get(PARAMS) == (DOCUMENT,)
+    else:
+        with pytest.raises(EntsoeServerError):
+            grabber.get(PARAMS)
+
+    assert len(responses.calls) == 1
+    assert sleeps == []
+
+
+@responses.activate
+def test_backoff_that_exhausts_the_retry_budget_prevents_another_attempt(
+    sleeps: list[float], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    elapsed = [0.0]
+    monkeypatch.setattr(client, "monotonic", lambda: elapsed[0])
+
+    def oversleep(delay: float) -> None:
+        sleeps.append(delay)
+        elapsed[0] = 31.0
+
+    monkeypatch.setattr(client, "sleep", oversleep)
+    stub(body=b"unavailable", status=503)
+
+    with pytest.raises(EntsoeServerError):
+        make_client(total_timeout=30.0).get(PARAMS)
+
+    assert len(responses.calls) == 1
+    assert len(sleeps) == 1
 
 
 @responses.activate
@@ -502,14 +636,44 @@ def test_unusable_retry_after_gives_up_like_a_missing_one(sleeps: list[float]) -
 
 
 @responses.activate
-@pytest.mark.parametrize("status", [200, 400])
-def test_truncated_acknowledgement_is_not_mistaken_for_a_document(
-    sleeps: list[float], status: int
+def test_truncated_error_acknowledgement_is_not_retried(
+    sleeps: list[float],
 ) -> None:
-    stub(body=b"<Acknowledgement_MarketDocument><Reason><code>999", status=status)
+    stub(body=b"<Acknowledgement_MarketDocument><Reason><code>999", status=400)
     with pytest.raises(EntsoeRequestError) as excinfo:
         make_client().get(PARAMS)
     assert excinfo.value.code is None
+    assert len(responses.calls) == 1
+    assert sleeps == []
+
+
+@responses.activate
+@pytest.mark.parametrize("archived", [False, True])
+def test_truncated_success_acknowledgement_is_retried(
+    sleeps: list[float], archived: bool
+) -> None:
+    body = b"<Acknowledgement_MarketDocument><Reason><code>999"
+    if archived:
+        body = zip_body({"acknowledgement.xml": body})
+    stub(body=body)
+    stub()
+
+    assert make_client().get(PARAMS) == (DOCUMENT,)
+    assert len(responses.calls) == 2
+    assert len(sleeps) == 1
+
+
+@responses.activate
+def test_truncated_success_acknowledgement_exhausts_retries(
+    sleeps: list[float],
+) -> None:
+    stub(body=b"<Acknowledgement_MarketDocument><Reason><code>999")
+
+    with pytest.raises(EntsoeServerError, match="not well-formed XML"):
+        make_client().get(PARAMS)
+
+    assert len(responses.calls) == 3
+    assert len(sleeps) == 2
 
 
 @responses.activate
@@ -525,16 +689,16 @@ def test_acknowledgement_without_a_reason_still_raises(sleeps: list[float]) -> N
 
 
 @responses.activate
-def test_document_mentioning_the_marker_late_is_still_a_document(
-    sleeps: list[float],
+@pytest.mark.parametrize("padding", [0, 4096])
+def test_document_mentioning_acknowledgements_is_still_a_document(
+    sleeps: list[float], padding: int
 ) -> None:
-    # The sniff only looks at the head of the body, so a market document that
-    # happens to quote the word further down is not misread as an error.
+    # A document's text never identifies its type, even near the root tag.
     closing_tag = b"</Publication_MarketDocument>"
     body = DOCUMENT.replace(
         closing_tag,
         b"<note>"
-        + b"x" * 4096
+        + b"x" * padding
         + b"Acknowledgement_MarketDocument</note>"
         + closing_tag,
     )

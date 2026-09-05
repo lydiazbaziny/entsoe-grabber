@@ -14,9 +14,11 @@ answer with a ZIP archive containing one or more XML documents.
 import logging
 import random
 import re
+import zlib
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
+from http import HTTPStatus
 from io import BytesIO
 from math import isfinite
 from time import monotonic, sleep
@@ -38,8 +40,6 @@ type XmlDocuments = tuple[bytes, ...]
 # status disambiguates it: 200 means no data, while 400 means an invalid query.
 _NO_MATCHING_DATA_CODE = "999"
 
-_ACKNOWLEDGEMENT_MARKER = b"Acknowledgement_MarketDocument"
-_ACKNOWLEDGEMENT_SNIFF_BYTES = 2048
 _TOKEN_PATTERN = re.compile(r"(securityToken=)[^&\s]*", re.IGNORECASE)
 _SUMMARY_LIMIT = 200
 
@@ -145,25 +145,22 @@ def _local_name(tag: str) -> str:
     return tag.rpartition("}")[2]
 
 
-def _acknowledgement_reason(content: bytes) -> tuple[str | None, str | None] | None:
-    """Extract ``(code, text)`` from an acknowledgement document.
+def _acknowledgement_reason(
+    root: ElementTree.Element,
+) -> tuple[str | None, str | None] | None:
+    """Extract ``(code, text)`` from a parsed acknowledgement document.
 
     Returns
     -------
     tuple or None
         ``None`` when the body is not an acknowledgement at all, which is the
-        normal case for a market document and for the HTML page a maintenance
-        window returns. A pair of ``None`` when it is one but carries no
-        readable reason.
+        normal case for a market document. A pair of ``None`` when it is an
+        acknowledgement but carries no readable reason. The parsed root name
+        identifies the document independently of encoding, leading comments,
+        or text that happens to mention another document type.
     """
-    if _ACKNOWLEDGEMENT_MARKER not in content[:_ACKNOWLEDGEMENT_SNIFF_BYTES]:
+    if _local_name(root.tag) != "Acknowledgement_MarketDocument":
         return None
-    try:
-        root = ElementTree.fromstring(content)
-    except ElementTree.ParseError:
-        # Truncated or corrupt: still an acknowledgement, just an unreadable
-        # one. Reporting it as a document would hand the caller garbage.
-        return None, None
     for element in root.iter():
         if _local_name(element.tag) != "Reason":
             continue
@@ -225,7 +222,14 @@ def _xml_documents(content: bytes) -> XmlDocuments:
                 documents = tuple(archive.read(info) for info in members)
         except EntsoeServerError:
             raise
-        except (BadZipFile, LargeZipFile, OSError, RuntimeError, ValueError) as exc:
+        except (
+            BadZipFile,
+            LargeZipFile,
+            OSError,
+            RuntimeError,
+            ValueError,
+            zlib.error,
+        ) as exc:
             raise EntsoeServerError(
                 f"HTTP 200: unusable ZIP archive ({type(exc).__name__})"
             ) from None
@@ -235,13 +239,13 @@ def _xml_documents(content: bytes) -> XmlDocuments:
 
     for name, document in zip(names, documents, strict=True):
         try:
-            ElementTree.fromstring(document)
+            root = ElementTree.fromstring(document)
         except ElementTree.ParseError as exc:
             raise EntsoeServerError(
                 f"HTTP 200: {name} is not well-formed XML: {exc}"
             ) from None
 
-        reason = _acknowledgement_reason(document)
+        reason = _acknowledgement_reason(root)
         if reason is None:
             continue
         code, text = reason
@@ -254,7 +258,7 @@ def _xml_documents(content: bytes) -> XmlDocuments:
 
 
 def _check(response: requests.Response) -> bytes:
-    """Return the body, or raise the error the response describes.
+    """Check HTTP status and return a success body for XML/ZIP validation.
 
     Raises
     ------
@@ -264,11 +268,10 @@ def _check(response: requests.Response) -> bytes:
         On 429.
     EntsoeServerError
         On 408, any 5xx, or an empty HTTP 200 response.
-    NoMatchingDataError
-        On HTTP 200 with an acknowledgement carrying reason code 999.
     EntsoeRequestError
-        When the body is any other acknowledgement, or the status is any
-        unexpected non-200 response.
+        On any other non-200 response, including its acknowledgement reason
+        when available. HTTP-200 acknowledgements and malformed XML are
+        classified by :func:`_xml_documents` after archive extraction.
     """
     status = response.status_code
 
@@ -278,27 +281,33 @@ def _check(response: requests.Response) -> bytes:
     # "Authentication failed." Reading the body first would file a bad token
     # as an empty result, and a scheduled run would then write nothing every
     # day without ever raising an error.
-    if status in (401, 403):
+    if status in (HTTPStatus.UNAUTHORIZED, HTTPStatus.FORBIDDEN):
         raise EntsoeAuthError(
             f"HTTP {status}: security token rejected (missing, invalid or suspended)"
         )
-    if status == 429:
+    if status == HTTPStatus.TOO_MANY_REQUESTS:
         raise EntsoeRateLimitError(
             "HTTP 429: rate limited by the platform",
             _retry_after_seconds(response.headers.get("Retry-After")),
         )
-    if status == 408 or status >= 500:
+    if (
+        status == HTTPStatus.REQUEST_TIMEOUT
+        or status >= HTTPStatus.INTERNAL_SERVER_ERROR
+    ):
         raise EntsoeServerError(f"HTTP {status}: {_summarise(response.content)}")
 
-    reason = _acknowledgement_reason(response.content)
-    if reason is not None:
-        code, text = reason
-        message = f"HTTP {status}: ENTSO-E returned no document (reason {code}): {text}"
-        if status == 200 and code == _NO_MATCHING_DATA_CODE:
-            raise NoMatchingDataError(message, code, text)
-        raise EntsoeRequestError(message, code, text)
-
-    if status != 200:
+    if status != HTTPStatus.OK:
+        try:
+            reason = _acknowledgement_reason(ElementTree.fromstring(response.content))
+        except ElementTree.ParseError:
+            # A damaged error body does not make a rejected request retryable.
+            reason = None
+        if reason is not None:
+            code, text = reason
+            message = (
+                f"HTTP {status}: ENTSO-E returned no document (reason {code}): {text}"
+            )
+            raise EntsoeRequestError(message, code, text)
         raise EntsoeRequestError(
             f"unexpected HTTP {status}: {_summarise(response.content)}"
         )
@@ -333,20 +342,21 @@ class EntsoeClient:
         Pre-built session, mainly for tests. One is created if omitted, and
         reused across calls so warm invocations skip the TLS handshake.
     connect_timeout, read_timeout
-        Per-attempt socket timeouts, in seconds. The platform allows itself
-        300s per request, so a read timeout is a judgement about when a slow
-        response stops being worth waiting for, not a limit it will respect.
+        Per-connection and socket-read timeouts, in seconds. The read timeout
+        limits inactivity between received bytes; a response that keeps
+        sending data can take longer. These do not bound total download time.
     max_attempts
         Total attempts per call, including the first.
     backoff_base, backoff_max
         Bounds for exponential backoff, in seconds, before jitter.
     total_timeout
-        Wall-clock budget for one call. When the next backoff would overrun it,
-        the client stops early instead of sleeping past its own deadline. It
-        does not abort a request already in flight, so the real worst case is
-        this plus ``connect_timeout`` plus ``read_timeout``: the last attempt
-        can start just inside the deadline and still run its full socket
-        timeout. Size the Lambda timeout against that sum, not this alone.
+        Elapsed-time budget for scheduling retries, measured from the start of
+        the call. Requests and backoff consume this budget; once it is spent,
+        no retry is started. An in-flight request is not interrupted, and a
+        successful response is accepted even if it finishes after the budget.
+        There is no fixed upper bound on call duration, including when adding
+        the socket timeouts to this budget. The Lambda timeout is the hard
+        limit on the complete invocation.
     """
 
     def __init__(
@@ -391,7 +401,7 @@ class EntsoeClient:
         self._max_attempts = max_attempts
         self._backoff_base = backoff_base
         self._backoff_max = backoff_max
-        self._total_timeout = total_timeout
+        self._retry_budget = total_timeout
 
     def get(self, params: Mapping[str, str]) -> XmlDocuments:
         """Fetch and validate all XML documents for one API query.
@@ -444,8 +454,8 @@ class EntsoeClient:
         self.close()
 
     def _request_with_retries(self, query: Mapping[str, str]) -> XmlDocuments:
-        """Run one logical request within its attempt and time budgets."""
-        deadline = monotonic() + self._total_timeout
+        """Run a request, bounding retry scheduling by attempts and elapsed time."""
+        deadline = monotonic() + self._retry_budget
 
         for attempt in range(1, self._max_attempts + 1):
             try:
@@ -521,7 +531,7 @@ class EntsoeClient:
         deadline: float,
         attempt: int,
     ) -> None:
-        """Wait for the next attempt, unless doing so exhausts the call budget."""
+        """Wait for the next attempt while the retry budget permits it."""
         if monotonic() + delay > deadline:
             logger.error(
                 "giving up: %s (waiting %.1fs would overrun the budget)",
@@ -538,5 +548,5 @@ class EntsoeClient:
         )
         sleep(delay)
         if monotonic() >= deadline:
-            logger.error("giving up: %s (call budget exhausted)", error)
+            logger.error("giving up: %s (retry budget exhausted)", error)
             raise error

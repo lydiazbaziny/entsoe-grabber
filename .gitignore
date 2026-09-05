@@ -31,7 +31,7 @@ terraform.rc
 .env
 .env.local
 
-notes.txt
+*.pdf
 
 CLAUDE.MD
 
