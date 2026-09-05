@@ -15,6 +15,19 @@ sudo chown -R "$(id -u):$(id -g)" \
 # with "failed to initialize build cache at /home/vscode/.cache/go-build".
 sudo chown "$(id -u):$(id -g)" "$HOME/.cache" 2>/dev/null || true
 
+# The claude-code devcontainer feature installed the CLI with `npm install -g`
+# as root, which leaves the npm global prefix unwritable for vscode: both
+# `claude update` and the background auto-updater then fail with "Insufficient
+# permissions to install update". The native installer puts the launcher in
+# ~/.local/bin and the versions under ~/.local/share/claude, owned by this
+# user, so updating works.
+echo "==> Installing Claude Code"
+curl -fsSL https://claude.ai/install.sh | bash ||
+  echo "    (install failed - run 'curl -fsSL https://claude.ai/install.sh | bash')"
+# remoteEnv covers the shells you open, but not this script -- lifecycle
+# commands get the container's own environment.
+export PATH="$HOME/.local/bin:$PATH"
+
 # uv reads requires-python from pyproject.toml and downloads that exact
 # interpreter if it is not already present. Nothing else pins the version.
 echo "==> Installing the project's Python and dependencies with uv"
@@ -45,7 +58,6 @@ printf '    python    : %s\n' "$(uv run python --version 2>&1)"
 printf '    uv        : %s\n' "$(uv --version 2>&1)"
 printf '    terraform : %s\n' "$(terraform version | head -1)"
 printf '    aws       : %s\n' "$(aws --version 2>&1)"
-printf '    node      : %s\n' "$(node --version 2>&1)"
 printf '    claude    : %s\n' "$(claude --version 2>&1)"
 printf '    pre-commit: %s\n' "$(uv run pre-commit --version 2>&1)"
 echo

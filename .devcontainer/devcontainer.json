@@ -15,17 +15,7 @@
     },
     "ghcr.io/va-h/devcontainers-features/uv:1": {
       "version": "latest"
-    },
-    // Explicit, and not optional. @anthropic-ai/claude-code requires Node >=22,
-    // but the claude-code feature's own fallback installs Node 18 when it finds
-    // no Node present -- which would leave a broken CLI. Declaring LTS (Node 24
-    // as of writing) means that fallback never runs.
-    "ghcr.io/devcontainers/features/node:1": {
-      "version": "lts"
-    },
-    // Brings the anthropic.claude-code VS Code extension with it, so it is not
-    // repeated in the extensions list below.
-    "ghcr.io/anthropics/devcontainer-features/claude-code:1": {}
+    }
   },
   "containerEnv": {
     "AWS_REGION": "${localEnv:AWS_REGION:eu-central-1}",
@@ -61,7 +51,14 @@
     "GIT_CONFIG_VALUE_0": "false"
   },
   "remoteEnv": {
-    "PATH": "${containerWorkspaceFolder}/.venv/bin:${containerEnv:PATH}"
+    // ~/.local/bin holds the Claude Code launcher. post-create.sh installs it
+    // there with the native installer, as the vscode user, so `claude update`
+    // and the background auto-updater can write to it. The claude-code
+    // devcontainer feature used to do this instead, but it runs
+    // `npm install -g` as root: every update then failed with "Insufficient
+    // permissions to install update". Nothing else in the project needed the
+    // Node the npm package pulled in, so that feature went too.
+    "PATH": "${containerWorkspaceFolder}/.venv/bin:/home/vscode/.local/bin:${containerEnv:PATH}"
   },
   "mounts": [
     "source=entsoe-grabber-uv-cache,target=/home/vscode/.cache/uv,type=volume",
@@ -82,7 +79,8 @@
         "amazonwebservices.aws-toolkit-vscode",
         "tamasfe.even-better-toml",
         "redhat.vscode-yaml",
-        "eamodio.gitlens"
+        "eamodio.gitlens",
+        "anthropic.claude-code"
       ],
       "settings": {
         "python.defaultInterpreterPath": "${workspaceFolder}/.venv/bin/python",
