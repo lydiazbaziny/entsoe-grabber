@@ -1,0 +1,35 @@
+terraform {
+  required_version = ">= 1.11.0, < 2.0.0"
+
+  # bucket and region come from infra/backend.hcl; see backend.hcl.example.
+  backend "s3" {
+    key          = "entsoe-grabber/dev/network.tfstate"
+    encrypt      = true
+    use_lockfile = true
+  }
+
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 6.62"
+    }
+
+    # Used indirectly by the fck-nat module for its instance bootstrap script.
+    cloudinit = {
+      source  = "hashicorp/cloudinit"
+      version = "~> 2.3"
+    }
+  }
+}
+
+provider "aws" {
+  region = var.aws_region
+
+  default_tags {
+    tags = {
+      Project     = var.project_name
+      Environment = var.environment
+      ManagedBy   = "terraform"
+    }
+  }
+}

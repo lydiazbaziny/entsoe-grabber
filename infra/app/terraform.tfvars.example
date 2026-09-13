@@ -1,0 +1,70 @@
+# Copy to terraform.tfvars and adjust. terraform.tfvars is gitignored.
+
+# If you change these, set the same values in infra/network/terraform.tfvars
+# and infra/storage/terraform.tfvars: this stack finds their resources by name.
+aws_region  = "eu-north-1"
+environment = "dev"
+
+# arm64 is a cost-effective choice for this dependency-free function.
+lambda_architecture = "arm64"
+
+schedule_expression = "cron(30 13 * * ? *)"
+
+# Set your recipients before deployment and confirm the SNS subscription emails
+# after apply. With an empty set, alarms exist but nobody receives email alerts.
+alarm_email_addresses = []
+
+# The real API token is written directly to SSM after deployment, so it never
+# lands in terraform.tfstate. See the README deployment steps.
+
+# Keep the XML the platform returned under `raw/`, next to the CSV under
+# `data/`, so a day can be re-serialised without a second request.
+store_raw_xml = true
+
+# --- what to scrape ----------------------------------------------------------
+#
+# Both documents below are the ones named in the assignment, for the Slovak
+# control area (SEPS, 10YSK-SEPS-----K). The second one was added purely by
+# appending to this map -- no code was written for it.
+#
+# `params` goes to the API verbatim. The codes come from the API guide:
+#   documentType  A71 generation forecast, A73 actual generation
+#   processType   A01 day ahead, A16 realised
+#   in_Domain     EIC code of the area
+#
+# periodStart and periodEnd are not here: the handler derives them from
+# date_offset_days, so a scheduled run always asks for the right day. The day
+# is a market day in market_timezone, which applies to every dataset.
+market_timezone = "Europe/Bratislava"
+
+datasets = {
+  # 14.1.C Day-ahead aggregated generation.
+  generation_forecast_day_ahead = {
+    # A forecast published today covers tomorrow.
+    date_offset_days = 1
+
+    params = {
+      documentType = "A71"
+      processType  = "A01"
+      in_Domain    = "10YSK-SEPS-----K"
+    }
+  }
+
+  # 16.1.A Actual generation per generation unit.
+  generation_actual_per_unit = {
+    # Actuals lag: yesterday is the most recent complete day.
+    date_offset_days = -1
+
+    params = {
+      documentType = "A73"
+      processType  = "A16"
+      in_Domain    = "10YSK-SEPS-----K"
+    }
+  }
+}
+
+# Other control areas, if you want them -- same shape, different in_Domain:
+#   Czechia  10YCZ-CEPS-----N
+#   Austria  10YAT-APG------L
+#   Hungary  10YHU-MAVIR----U
+#   Poland   10YPL-AREA-----S

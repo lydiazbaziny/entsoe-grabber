@@ -1,0 +1,95 @@
+# Based on the shared .pre-commit-config.yaml-template, with three changes:
+#   - ruff tracks the version pinned in pyproject.toml, not the template's
+#   - hadolint dropped: the devcontainer uses a prebuilt image, no Dockerfile
+#   - a local repo adds mypy and terraform fmt, which the template lacks
+repos:
+    - repo: https://github.com/pre-commit/pre-commit-hooks
+      rev: v6.0.0
+      hooks:
+          - id: check-added-large-files
+          - id: check-ast
+          - id: check-case-conflict
+          - id: check-executables-have-shebangs
+          # devcontainer.json is JSONC -- its comments are deliberate.
+          - id: check-json
+            exclude: ^\.devcontainer/devcontainer\.json$
+          - id: check-merge-conflict
+          - id: check-shebang-scripts-are-executable
+          - id: check-symlinks
+          - id: check-toml
+          - id: check-yaml
+          - id: destroyed-symlinks
+          - id: detect-private-key
+          - id: end-of-file-fixer
+          - id: fix-byte-order-marker
+          - id: mixed-line-ending
+            args: [--fix=lf]
+          - id: requirements-txt-fixer
+          - id: trailing-whitespace
+            args: [--markdown-linebreak-ext=md]
+    # Kept in step with `ruff==0.16.*` in pyproject.toml. Bump both together.
+    - repo: https://github.com/astral-sh/ruff-pre-commit
+      rev: v0.16.5
+      hooks:
+          - id: ruff-check
+            args: ["--fix"]
+          - id: ruff-format
+            name: ruff format
+    - repo: https://github.com/jumanjihouse/pre-commit-hook-yamlfmt
+      rev: 0.2.3
+      hooks:
+          - id: yamlfmt
+            args: [--mapping, "4", --sequence, "6", --offset, "4", --preserve-quotes, --implicit_start]
+    - repo: https://github.com/scop/pre-commit-shfmt
+      rev: v3.12.0-2
+      hooks:
+          # -i 2 keeps the repo's existing 2-space shell style; shfmt's default
+          # would reindent both scripts to tabs.
+          - id: shfmt
+            # --write is the hook's own default arg; supplying args replaces it.
+            args: [--write, -i, "2"]
+    - repo: https://github.com/shellcheck-py/shellcheck-py
+      rev: v0.11.0.1
+      hooks:
+          - id: shellcheck
+    - repo: https://github.com/igorshubovych/markdownlint-cli
+      rev: v0.48.0
+      hooks:
+          - id: markdownlint
+          - id: markdownlint-fix
+    - repo: https://github.com/gitleaks/gitleaks
+      rev: v8.30.0
+      hooks:
+          - id: gitleaks
+    - repo: https://github.com/crate-ci/typos
+      rev: v1.44.0
+      hooks:
+          - id: typos
+    - repo: https://github.com/tox-dev/pyproject-fmt
+      rev: v2.16.2
+      hooks:
+          - id: pyproject-fmt
+    # Neither tool has an upstream hook worth pinning separately: mypy is
+    # already pinned in pyproject.toml and needs the project's own venv to see
+    # its stubs, and terraform comes from a devcontainer feature.
+    #
+    # `terraform validate` is deliberately absent: it needs `make tf-init` plus
+    # the built zips on disk, because the config hashes them with
+    # filebase64sha256. It stays in `make tf-lint`.
+    - repo: local
+      hooks:
+          - id: mypy
+            name: mypy
+            entry: uv run mypy
+            language: system
+            types: [python]
+            pass_filenames: false
+            require_serial: true
+          # Terraform is absent when committing from the host, so skip rather
+          # than block there; `make tf-lint` and the container still catch it.
+          - id: terraform-fmt
+            name: terraform fmt
+            entry: bash -c 'command -v terraform >/dev/null || { echo "terraform not installed - skipped"; exit 0; }; terraform -chdir=infra fmt -recursive'
+            language: system
+            files: ^infra/.*\.tf$
+            pass_filenames: false
