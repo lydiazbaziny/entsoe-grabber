@@ -1,0 +1,16 @@
+# Copy to backend.hcl (gitignored). Shared by every stack: `make tf-init`
+# passes it to `terraform init`, and each stack sets its own state `key`.
+#
+# State written inside a devcontainer lives in the container volume and is lost
+# when the container is rebuilt, hence a remote backend.
+#
+# Bootstrap the bucket once, out-of-band (it cannot manage its own state):
+#
+#   aws s3api create-bucket --bucket my-tfstate-xxx-8f21c6d9 \
+#     --region eu-north-1 \
+#     --create-bucket-configuration LocationConstraint=eu-north-1
+#   aws s3api put-bucket-versioning --bucket my-tfstate-xxx-8f21c6d9 \
+#     --versioning-configuration Status=Enabled
+
+bucket = "my-tfstate-xxx-8f21c6d9"
+region = "eu-north-1"
